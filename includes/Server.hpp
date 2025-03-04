@@ -1,21 +1,25 @@
 #pragma once
 
-#include <iostream>
-#include <sys/socket.h>
+#include <string>
 #include <netinet/in.h>
-#include <unistd.h>
-#include <cstring>
+#include "Socket.hpp"
 
-class Server {
-private:
-    int                 _serverFd;
-    struct sockaddr_in  _serverAddress;
-    int                 _addrLen;
-public:
-    Server();
-    Server(const Server &other);
-    Server &operator=(const Server &other);
-    ~Server();
+class Server 
+{
+    public:
+        Server(const std::string& conf);
+        ~Server() = default;
+    
+        void run();
 
-    void run();
+    private:
+        std::string _configPath;
+        std::string _host;
+        std::string _root;
+        int         _port;
+
+        Socket      _socket;
+
+		void parseConfig();
+		void handleRequest(int clientSocket);
 };
