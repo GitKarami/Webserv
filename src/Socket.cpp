@@ -1,4 +1,4 @@
-#include "Socket.hpp"
+#include "../includes/Socket.hpp"
 #include "stdexcept"
 #include <unistd.h>
 #include <arpa/inet.h>
@@ -42,6 +42,7 @@ int Socket::accept()
 	int clientSocket = ::accept(_socketFd, (struct sockaddr*)&_address, (socklen_t*)&_addrLen);
 	if (clientSocket < 0)
 		throw std::runtime_error("Failed to accept connection");
+	return clientSocket;
 }
 
 void Socket::setNonBLocking()

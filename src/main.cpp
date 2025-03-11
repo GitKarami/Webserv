@@ -1,10 +1,14 @@
 #include "../includes/Server.hpp"
-#include "../includes/Request.hpp"
-#include "../includes/Response.hpp"
 
-int main()
+
+int main(int argc, char** argv)
 {
-    Server server;
+    if (argc != 2)
+    {
+        std::cerr << "Usage: " << argv[0] << " <config file>" << std::endl;
+        return 1;
+    }
+    Server server(argv[1]);
     server.run();
     return 0;
 }

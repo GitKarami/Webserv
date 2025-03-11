@@ -2,7 +2,10 @@
 
 #include <string>
 #include <netinet/in.h>
-#include "Socket.hpp"
+#include <iostream>
+#include "../includes/Socket.hpp"
+#include "../includes/Request.hpp"
+#include "../includes/Response.hpp"
 
 class Server 
 {
@@ -22,4 +25,5 @@ class Server
 
 		void parseConfig();
 		void handleRequest(int clientSocket);
+        void setupSocket();
 };
