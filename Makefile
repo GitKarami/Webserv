@@ -1,24 +1,44 @@
-CXX = c++
-CXXFLAGS = -Wall -Wextra -std=c++11
-TARGET = server
-SRCDIR = src
-OBJDIR = obj
-SRCS = $(wildcard $(SRCDIR)/*.cpp)
-OBJS = $(patsubst $(SRCDIR)/%.cpp, $(OBJDIR)/%.o, $(SRCS))
+# Compiler and flags
+CXX := c++
+CXXFLAGS := -Wall -Wextra -Werror -std=c++11 -g -Iincludes
 
-all: $(TARGET)
+# Source files and object files
+SRCS_DIR := src
+OBJS_DIR := obj
 
-$(TARGET): $(OBJS)
-	$(CXX) $(CXXFLAGS) -o $@ $^
+SRCS := $(wildcard $(SRCS_DIR)/*.cpp)
+OBJS := $(patsubst $(SRCS_DIR)/%.cpp,$(OBJS_DIR)/%.o,$(SRCS))
 
-$(OBJDIR)/%.o: $(SRCDIR)/%.cpp | $(OBJDIR)
+# Target executable name
+NAME := webserv
+
+# Header directories (using -Iincludes)
+
+# Default rule
+all: $(NAME)
+
+# Linking the executable
+$(NAME): $(OBJS)
+	$(CXX) $(CXXFLAGS) $(OBJS) -o $(NAME)
+	@echo "Webserv compiled successfully!"
+
+# Compiling source files into object files
+$(OBJS_DIR)/%.o: $(SRCS_DIR)/%.cpp
+	@mkdir -p $(OBJS_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(OBJDIR):
-	mkdir -p $(OBJDIR)
-
+# Cleaning object files
 clean:
-	rm -f $(OBJS) $(TARGET)
-	rm -rf $(OBJDIR)
+	@rm -rf $(OBJS_DIR)
+	@echo "Object files removed."
 
-.PHONY: all clean
+# Cleaning executable and object files
+fclean: clean
+	@rm -f $(NAME)
+	@echo "Executable removed."
+
+# Rebuilding the project
+re: fclean all
+
+# Phony targets
+.PHONY: all clean fclean re

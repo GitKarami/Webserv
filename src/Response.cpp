@@ -1,166 +1,123 @@
-#include "../includes/Response.hpp"
+#include "Response.hpp"
+#include "Utils.hpp"
 #include <sstream>
+#include <vector>
+#include <algorithm> // for std::transform
 
-Response::Response() : _statusCode(200)
-{
-    // Initialize with default headers
-    _headers["Server"] = "WebServ/1.0";
-    _headers["Connection"] = "close";
+Response::Response() {
+    clear();
 }
 
-Response::Response(int statusCode) : _statusCode(statusCode)
-{
-    // Initialize with default headers
-    _headers["Server"] = "WebServ/1.0";
-    _headers["Connection"] = "close";
+Response::~Response() {}
+
+void Response::clear() {
+    _httpVersion = "HTTP/1.1";
+    _statusCode = 200;
+    _statusMessage = Utils::getHttpStatusMessage(_statusCode);
+    _headers.clear();
+    _body.clear();
+    _rawResponse.clear();
+    _bytesSent = 0;
 }
 
-Response::~Response()
-{
-}
-
-void Response::setStatusCode(int code)
-{
+void Response::setStatusCode(int code) {
     _statusCode = code;
+    _statusMessage = Utils::getHttpStatusMessage(code);
 }
 
-int Response::getStatusCode() const
-{
-    return _statusCode;
+void Response::setHttpVersion(const std::string& version) {
+    _httpVersion = version;
 }
 
-std::string Response::getStatusText() const
-{
-    return getStatusTextForCode(_statusCode);
+void Response::setHeader(const std::string& key, const std::string& value) {
+    // Normalize header key for consistent checking (e.g., Content-Length)
+    std::string lowerKey = key;
+    std::transform(lowerKey.begin(), lowerKey.end(), lowerKey.begin(), ::tolower);
+    _headers[lowerKey] = value; // Overwrite if exists
 }
 
-void Response::setHeader(const std::string& key, const std::string& value)
-{
-    _headers[key] = value;
-}
-
-std::string Response::getHeader(const std::string& key) const
-{
-    std::map<std::string, std::string>::const_iterator it = _headers.find(key);
-    if (it != _headers.end())
-        return it->second;
-    return "";
-}
-
-const std::map<std::string, std::string>& Response::getHeaders() const
-{
-    return _headers;
-}
-
-void Response::setBody(const std::string& body)
-{
+void Response::setBody(const std::vector<char>& body) {
     _body = body;
-    
-    // Auto-set Content-Length header
-    std::stringstream ss;
-    ss << body.length();
-    setHeader("Content-Length", ss.str());
 }
 
-std::string Response::getBody() const
-{
-    return _body;
+void Response::setBody(const std::string& body) {
+    _body.assign(body.begin(), body.end());
 }
 
-std::string Response::toString() const
-{
-    std::stringstream response;
-    
-    // Status line
-    response << "HTTP/1.1 " << _statusCode << " " << getStatusTextForCode(_statusCode) << "\r\n";
-    
+void Response::addDefaultHeaders() {
+    if (_headers.find("date") == _headers.end()) {
+        setHeader("Date", Utils::getCurrentHttpDate());
+    }
+    if (_headers.find("server") == _headers.end()) {
+        setHeader("Server", "Webserv/0.1");
+    }
+    // Content-Length is crucial
+    if (_headers.find("content-length") == _headers.end()) {
+        // Only set Content-Length if body is present and not chunked (chunked handled differently)
+        // Also, responses like 204 No Content or 304 Not Modified MUST NOT have a body or Content-Length
+        bool shouldHaveBody = (_statusCode >= 200 && _statusCode != 204 && _statusCode != 304);
+        if (shouldHaveBody) {
+             setHeader("Content-Length", std::to_string(_body.size()));
+        } else {
+            // Ensure body is empty for codes that forbid it
+            _body.clear();
+        }
+    }
+    // Add Connection header? (e.g., Connection: close or Connection: keep-alive)
+    // Defaulting to close might be simpler initially.
+    if (_headers.find("connection") == _headers.end()) {
+        setHeader("Connection", "close");
+    }
+}
+
+void Response::buildResponse() {
+    _rawResponse.clear();
+    _bytesSent = 0;
+
+    addDefaultHeaders();
+
+    // Status Line
+    std::string statusLine = _httpVersion + " " + std::to_string(_statusCode) + " " + _statusMessage + "\r\n";
+    _rawResponse.insert(_rawResponse.end(), statusLine.begin(), statusLine.end());
+
     // Headers
-    for (std::map<std::string, std::string>::const_iterator it = _headers.begin(); 
-         it != _headers.end(); ++it)
-    {
-        response << it->first << ": " << it->second << "\r\n";
+    for (const auto& pair : _headers) {
+        std::string headerLine = pair.first + ": " + pair.second + "\r\n";
+        // Header keys are already normalized to lowercase in setHeader
+        _rawResponse.insert(_rawResponse.end(), headerLine.begin(), headerLine.end());
     }
-    
-    // Separator between headers and body
-    response << "\r\n";
-    
-    // Body
-    if (!_body.empty())
-    {
-        response << _body;
-    }
-    
-    return response.str();
+
+    // End of Headers
+    _rawResponse.push_back('\r');
+    _rawResponse.push_back('\n');
+
+    // Body (if any)
+    _rawResponse.insert(_rawResponse.end(), _body.begin(), _body.end());
 }
 
-std::string Response::getStatusTextForCode(int code) const
-{
-    switch (code)
-    {
-        case 100: return "Continue";
-        case 101: return "Switching Protocols";
-        case 200: return "OK";
-        case 201: return "Created";
-        case 202: return "Accepted";
-        case 204: return "No Content";
-        case 206: return "Partial Content";
-        case 300: return "Multiple Choices";
-        case 301: return "Moved Permanently";
-        case 302: return "Found";
-        case 303: return "See Other";
-        case 304: return "Not Modified";
-        case 307: return "Temporary Redirect";
-        case 308: return "Permanent Redirect";
-        case 400: return "Bad Request";
-        case 401: return "Unauthorized";
-        case 403: return "Forbidden";
-        case 404: return "Not Found";
-        case 405: return "Method Not Allowed";
-        case 406: return "Not Acceptable";
-        case 408: return "Request Timeout";
-        case 409: return "Conflict";
-        case 410: return "Gone";
-        case 411: return "Length Required";
-        case 413: return "Payload Too Large";
-        case 414: return "URI Too Long";
-        case 415: return "Unsupported Media Type";
-        case 416: return "Range Not Satisfiable";
-        case 417: return "Expectation Failed";
-        case 418: return "I'm a teapot";
-        case 426: return "Upgrade Required";
-        case 429: return "Too Many Requests";
-        case 500: return "Internal Server Error";
-        case 501: return "Not Implemented";
-        case 502: return "Bad Gateway";
-        case 503: return "Service Unavailable";
-        case 504: return "Gateway Timeout";
-        case 505: return "HTTP Version Not Supported";
-        default: return "Unknown Status";
+const char* Response::getRawResponsePtr() const {
+    if (_rawResponse.empty() || _bytesSent >= _rawResponse.size()) {
+        return nullptr;
+    }
+    return _rawResponse.data() + _bytesSent;
+}
+
+size_t Response::getRawResponseSize() const {
+    return _rawResponse.size();
+}
+
+size_t Response::getBytesSent() const {
+    return _bytesSent;
+}
+
+void Response::bytesSent(size_t bytes) {
+    _bytesSent += bytes;
+    // Clamp to avoid overflow, although logically should not exceed total size
+    if (_bytesSent > _rawResponse.size()) {
+        _bytesSent = _rawResponse.size();
     }
 }
 
-std::string Response::getResponse() const
-{
-    std::stringstream responseStream;
-    
-    // Status line
-    responseStream << "HTTP/1.1 " << _statusCode << " " << getStatusTextForCode(_statusCode) << "\r\n";
-    
-    // Headers
-    for (std::map<std::string, std::string>::const_iterator it = _headers.begin(); 
-         it != _headers.end(); ++it)
-    {
-        responseStream << it->first << ": " << it->second << "\r\n";
-    }
-    
-    // Empty line between headers and body
-    responseStream << "\r\n";
-    
-    // Body
-    if (!_body.empty())
-    {
-        responseStream << _body;
-    }
-    
-    return responseStream.str();
-}
+bool Response::isComplete() const {
+    return !_rawResponse.empty() && (_bytesSent >= _rawResponse.size());
+} 
