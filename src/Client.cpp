@@ -1,252 +1,240 @@
 #include "Client.hpp"
-#include "Utils.hpp" // For error messages, potentially
-#include <iostream>   // For cerr
-#include <sys/socket.h> // For recv, send
-#include <unistd.h>     // For close (handled by Socket RAII), fcntl
-#include <fcntl.h>      // For fcntl, O_NONBLOCK
+#include <unistd.h> // for close, read, write
+#include <iostream>
 #include <vector>
+#include <sys/socket.h> // for recv, send
+#include <cstring> // for strerror
+#include <cerrno> // for errno
+#include <utility> // For std::move
 
-// Constructor
-Client::Client(int clientFd, const ServerConfig* config)
-    : _socket(clientFd), _config(config), _markedForRemoval(false) {
-    // Set socket to non-blocking
-    if (!_socket.setNonBlocking()) {
-        std::cerr << "Error setting client socket to non-blocking." << std::endl;
-        _markedForRemoval = true; // Mark for removal if setup fails
-        // _socket destructor will handle closing the fd
-    }
-    _lastActivityTime = std::time(nullptr); // Initialize last activity time
-    // std::cout << "Client connected: fd=" << getFd() << std::endl; // Debug
+// #define READ_BUFFER_SIZE 4096 // <-- Remove definition from here
+
+Client::Client(int fd, const struct sockaddr_in& addr) :
+    _clientFd(fd),
+    _clientAddr(addr),
+    _state(AWAITING_REQUEST),
+    _bytesSent(0),
+    _requestParsed(false)
+{
+    // std::cout << "Client created for fd=" << _clientFd << std::endl;
 }
 
-// Destructor
 Client::~Client() {
-    // std::cout << "Client disconnected: fd=" << getFd() << std::endl; // Debug
-    // Socket RAII handles closing the fd
+    // std::cout << "Client destroyed for fd=" << _clientFd << std::endl;
+    if (_clientFd >= 0) {
+        // Closing is handled by Server::handleClientDisconnection to ensure epoll removal
+        // close(_clientFd);
+    }
 }
 
-// --- Getters ---
+void Client::clear() {
+     _requestBuffer.clear();
+     _responseBuffer.clear();
+     _request = Request(); // Reset request object
+     _requestParsed = false;
+     _bytesSent = 0;
+     _state = AWAITING_REQUEST;
+     // Keep _clientFd and _clientAddr
+}
+
+
 int Client::getFd() const {
-    return _socket.getFd();
+    return _clientFd;
 }
 
-const ServerConfig* Client::getConfig() const {
-    return _config;
+const struct sockaddr_in& Client::getAddress() const {
+    return _clientAddr;
 }
 
-// Check if response is built and ready to be sent (not fully sent yet)
-bool Client::isReadyToSend() const {
-    return !_response.isComplete() && _response.getRawResponsePtr() != nullptr;
+ClientState Client::getState() const {
+    return _state;
 }
 
-bool Client::isMarkedForRemoval() const {
-    return _markedForRemoval;
+void Client::setState(ClientState newState) {
+    // std::cout << "Client fd=" << _clientFd << " state changed to " << newState << std::endl;
+    _state = newState;
 }
 
-// --- I/O Handlers ---
+const std::string& Client::getRawRequest() const {
+    return _requestBuffer;
+}
 
-Client::IoResult Client::handleRead() {
-    if (_markedForRemoval) return Error;
+bool Client::isParsed() const {
+    return _requestParsed;
+}
 
-    char buffer[4096]; // Read buffer
-    ssize_t bytesRead;
+// Reads data from socket into _requestBuffer
+// Returns: bytes read, 0 on EOF, -1 on error, -2 on EAGAIN/EWOULDBLOCK
+ssize_t Client::receiveData() {
+    std::vector<char> buffer(READ_BUFFER_SIZE);
+    ssize_t bytes_read = recv(_clientFd, buffer.data(), buffer.size(), 0);
 
-    // --- DEBUG LOGGING ---
-    std::cout << "[DEBUG Client fd=" << getFd() << "] Entering handleRead" << std::endl;
-
-    bytesRead = recv(getFd(), buffer, sizeof(buffer), 0);
-    _lastActivityTime = std::time(nullptr);
-
-    // --- DEBUG LOGGING ---
-    std::cout << "[DEBUG Client fd=" << getFd() << "] recv returned: " << bytesRead;
-    if (bytesRead < 0) std::cout << " (errno: " << errno << ")";
-    std::cout << std::endl;
-
-    if (bytesRead == 0) {
+    if (bytes_read > 0) {
+        _requestBuffer.append(buffer.data(), bytes_read);
+        // Check if headers are complete after receiving new data
+        if (isRequestReady() && _state == AWAITING_REQUEST) {
+            _state = REQUEST_RECEIVED;
+            std::cout << "Client fd=" << _clientFd << ": Request received." << std::endl;
+        }
+    } else if (bytes_read == 0) {
         // Connection closed by peer
-        std::cout << "[DEBUG Client fd=" << getFd() << "] Connection closed by peer." << std::endl;
-        _markedForRemoval = true;
-        return Closed;
-    } else if (bytesRead < 0) {
-        // Error or non-blocking would block
+        std::cout << "Client fd=" << _clientFd << ": Connection closed by peer." << std::endl;
+        _state = RESPONSE_SENT; // Treat as finished
+        return 0; // Indicate EOF
+    } else { // bytes_read < 0
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            // --- DEBUG LOGGING ---
-            std::cout << "[DEBUG Client fd=" << getFd() << "] recv would block (EAGAIN/EWOULDBLOCK)." << std::endl;
-            return Success; // Nothing to read right now
+             // No more data available right now (non-blocking)
+            return -2; // Indicate non-blocking would block
         } else {
-            perror("recv error");
-            std::cerr << "[DEBUG Client fd=" << getFd() << "] recv error." << std::endl;
-            _markedForRemoval = true;
-            return Error;
-        }
-    } else {
-        // Data received
-        std::cout << "[DEBUG Client fd=" << getFd() << "] Received " << bytesRead << " bytes." << std::endl;
-
-        // Pass received data directly to the parser
-        Request::ParseState parseStatus = _request.parse(buffer, bytesRead);
-
-        // --- DEBUG LOGGING ---
-        std::cout << "[DEBUG Client fd=" << getFd() << "] Request::parse returned state: " << parseStatus << std::endl;
-
-        if (parseStatus == Request::Complete) {
-            std::cout << "[DEBUG Client fd=" << getFd() << "] Request complete, processing..." << std::endl;
-            processRequest(); // Request fully parsed, process it
-            return Success;   // Ready for potential write
-        } else if (parseStatus == Request::Error) {
-            int errorCode = _request.getErrorCode();
-            std::cerr << "[DEBUG Client fd=" << getFd() << "] Request parsing error (Code: " << errorCode << ")" << std::endl;
-            buildErrorResponse(errorCode); // Build appropriate error response (400, 413, 505 etc.)
-            return Success; // Ready to send error response
-        } else {
-            // Parsing incomplete (state is something like ParsingHeaders, ParsingBody etc.)
-            std::cout << "[DEBUG Client fd=" << getFd() << "] Request parsing incomplete." << std::endl;
-            return Success; // Need more data
+            // Actual error
+            perror("recv failed");
+            _state = RESPONSE_SENT; // Treat as finished/error
+            return -1; // Indicate error
         }
     }
+    return bytes_read;
 }
 
-Client::IoResult Client::handleWrite() {
-    if (_markedForRemoval) return Error; // Already marked for removal, don't try to write
-    // --- DEBUG LOGGING ---
-    std::cout << "[DEBUG Client fd=" << getFd() << "] Entering handleWrite. isReadyToSend()=" << isReadyToSend() << std::endl;
+// Check if the request headers seem complete (contains "\r\n\r\n")
+bool Client::isRequestReady() const {
+    return _requestBuffer.find("\r\n\r\n") != std::string::npos;
+}
 
-    if (!isReadyToSend()) return Success; // Nothing ready/pending to send
-
-    const char* dataToSend = _response.getRawResponsePtr();
-    // Ensure dataSize calculation uses the remaining bytes
-    size_t remainingSize = _response.getRawResponseSize() - _response.getBytesSent();
-
-    // --- DEBUG LOGGING ---
-    std::cout << "[DEBUG Client fd=" << getFd() << "] Attempting to send " << remainingSize << " bytes." << std::endl;
-
-    if (!dataToSend || remainingSize == 0) {
-         // This state should ideally be covered by isReadyToSend(), but double-check.
-        // --- DEBUG LOGGING ---
-        std::cerr << "[DEBUG Client fd=" << getFd() << "] handleWrite called but no data available (ptr=" 
-                  << (void*)dataToSend << ", remaining=" << remainingSize 
-                  << ", isComplete=" << _response.isComplete() << "). Marking for removal." << std::endl;
-        _markedForRemoval = true; // Mark for removal due to inconsistency
-        return Error;
-    }
-
-
-    ssize_t bytesSent = send(getFd(), dataToSend, remainingSize, 0);
-    _lastActivityTime = std::time(nullptr);
-
-    // --- DEBUG LOGGING ---
-    std::cout << "[DEBUG Client fd=" << getFd() << "] send returned: " << bytesSent;
-    if (bytesSent < 0) std::cout << " (errno: " << errno << ")";
-    std::cout << std::endl;
-
-    if (bytesSent < 0) {
-        // Error or non-blocking would block
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            std::cout << "[DEBUG Client fd=" << getFd() << "] send would block (EAGAIN/EWOULDBLOCK)." << std::endl;
-            return Success; // Cannot write right now, try again later
-        } else if (errno == EPIPE) { // Broken pipe (client closed connection)
-            std::cout << "[DEBUG Client fd=" << getFd() << "] send failed (EPIPE), marking for removal." << std::endl;
-            _markedForRemoval = true;
-            return Closed;
-        } else {
-            perror("send error");
-            std::cerr << "[DEBUG Client fd=" << getFd() << "] send error, marking for removal." << std::endl;
-            _markedForRemoval = true;
-            return Error;
-        }
-    } else {
-        // Data sent successfully
-        std::cout << "[DEBUG Client fd=" << getFd() << "] Sent " << bytesSent << " bytes." << std::endl;
-        _response.bytesSent(static_cast<size_t>(bytesSent));
-        if (_response.isComplete()) {
-            std::cout << "[DEBUG Client fd=" << getFd() << "] Response completely sent." << std::endl;
-            // Response is fully sent. Handle based on Connection header (or default).
-            std::string connectionHeader = _request.getHeader("Connection"); // Assuming Request has getHeader
-            std::cout << "[DEBUG Client fd=" << getFd() << "] Connection header: '" << connectionHeader << "'" << std::endl;
-             // Normalize connectionHeader if necessary (e.g., to lower case)
-            if (connectionHeader.find("keep-alive") != std::string::npos) {
-                 std::cout << "[DEBUG Client fd=" << getFd() << "] Keep-alive requested. Resetting client state." << std::endl;
-                 // Reset for the next request
-                 _request.clear();
-                 _response.clear();
-                 // Don't mark for removal, wait for next read event.
-                return Complete; // Indicate the *current response* is complete
+// Get the parsed request object
+Request& Client::getRequest() {
+    if (!_requestParsed && isRequestReady()) {
+        try {
+            // Call the actual parsing function
+            if (_request.parse(_requestBuffer)) {
+                 _requestParsed = true;
+                 std::cout << "Client fd=" << _clientFd << ": Request parsed successfully." << std::endl;
             } else {
-                 std::cout << "[DEBUG Client fd=" << getFd() << "] Connection: close or header absent. Marking for removal." << std::endl;
-                 // Default or "Connection: close"
-                 _markedForRemoval = true; // Mark for removal after sending
-                 return Complete; // Indicate response complete, connection will close.
-             }
+                 // Parsing failed (e.g., bad syntax, incomplete body needed)
+                 // If parse returns false because more body data is needed, keep _requestParsed = false
+                 // If parse returns false due to syntax error, maybe throw or set error state?
+                 // For now, assume false means syntax error or unrecoverable issue.
+                 std::cerr << "Client fd=" << _clientFd << ": Request::parse returned false." << std::endl;
+                  _requestParsed = true; // Prevent retry loop on syntax error
+                  _state = GENERATING_RESPONSE; // Generate 400 Bad Request
+                  // Potentially clear the request object or set error flag in it?
+            }
+        } catch (const std::exception& e) {
+             std::cerr << "Client fd=" << _clientFd << ": Request parsing exception: " << e.what() << std::endl;
+             _requestParsed = true; // Mark as parsed even on error to avoid loop
+             _state = GENERATING_RESPONSE; // Move to generate error response
+        }
+    }
+    return _request;
+}
 
-        } else {
-            // More data remains to be sent
-            std::cout << "[DEBUG Client fd=" << getFd() << "] More data to send (" << (_response.getRawResponseSize() - _response.getBytesSent()) << " remaining)." << std::endl;
-            return Success;
+
+// Store the generated response string
+void Client::setResponse(const Response& response) {
+    // Use Response::toString() to generate the full response string
+    _responseBuffer = response.toString();
+    _bytesSent = 0;
+    setState(SENDING_RESPONSE);
+    std::cout << "Client fd=" << _clientFd << ": Response set (" << _responseBuffer.length() << " bytes)." << std::endl;
+     // Optional: Log response headers for debugging
+     // size_t headers_end = _responseBuffer.find("\r\n\r\n");
+     // if (headers_end != std::string::npos) {
+     //      std::cout << "--- Response Headers fd=" << _clientFd << " ---\n"
+     //                << _responseBuffer.substr(0, headers_end) << "\n------------------------" << std::endl;
+     // }
+}
+
+// Send data from _responseBuffer
+// Returns: bytes sent, 0 if nothing to send, -1 on error, -2 on EAGAIN/EWOULDBLOCK
+ssize_t Client::sendData() {
+    if (_responseBuffer.empty() || _bytesSent >= _responseBuffer.length()) {
+        return 0; // Nothing (more) to send
+    }
+
+    size_t bytes_to_send = _responseBuffer.length() - _bytesSent;
+    const char* buffer_ptr = _responseBuffer.c_str() + _bytesSent;
+
+    ssize_t bytes_written = send(_clientFd, buffer_ptr, bytes_to_send, 0); // Consider MSG_NOSIGNAL
+
+    if (bytes_written > 0) {
+        _bytesSent += bytes_written;
+        // std::cout << "Client fd=" << _clientFd << ": Sent " << bytes_written << " bytes (" << _bytesSent << "/" << _responseBuffer.length() << ")" << std::endl;
+        if (isResponseFullySent()) {
+            std::cout << "Client fd=" << _clientFd << ": Full response sent." << std::endl;
+            setState(RESPONSE_SENT);
+            // If keep-alive: clear(); and set state AWAITING_REQUEST
+            // If not keep-alive: leave state as RESPONSE_SENT for server to close
+        }
+        return bytes_written;
+    } else if (bytes_written == 0) {
+        // Should not happen with TCP unless bytes_to_send was 0
+        std::cerr << "Client fd=" << _clientFd << ": send() returned 0." << std::endl;
+        return 0;
+    } else { // bytes_written < 0
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            // Socket buffer is full, try again later
+             std::cout << "Client fd=" << _clientFd << ": send() would block (EAGAIN/EWOULDBLOCK)." << std::endl;
+            return -2; // Indicate non-blocking would block
+        } else if (errno == EPIPE) {
+             // Client closed connection unexpectedly (broken pipe)
+            std::cerr << "Client fd=" << _clientFd << ": send() failed (Broken pipe)." << std::endl;
+             setState(RESPONSE_SENT); // Mark as done/error
+             return -1;
+        }
+         else {
+            // Other error
+            perror("send failed");
+            setState(RESPONSE_SENT); // Mark as done/error
+            return -1; // Indicate error
         }
     }
 }
 
-// --- Timeout Check ---
-bool Client::checkTimeout(time_t currentTime, time_t timeoutSeconds) {
-    if (difftime(currentTime, _lastActivityTime) > timeoutSeconds) {
-        // std::cout << "Client timed out: fd=" << getFd() << std::endl;
-        _markedForRemoval = true;
-        return true;
+bool Client::isResponseFullySent() const {
+    return _bytesSent == _responseBuffer.length() && !_responseBuffer.empty();
+}
+
+// --- Move Constructor ---
+Client::Client(Client&& other) noexcept :
+    _clientFd(other._clientFd),
+    _clientAddr(other._clientAddr), // sockaddr_in is trivially copyable
+    _state(other._state),
+    _requestBuffer(std::move(other._requestBuffer)), // Move strings
+    _responseBuffer(std::move(other._responseBuffer)),
+    _bytesSent(other._bytesSent),
+    _request(std::move(other._request)), // Assuming Request is movable
+    _requestParsed(other._requestParsed)
+{
+    // Leave the moved-from object in a defined (but unusable for socket ops) state
+    other._clientFd = -1; // Mark fd as invalid in the source
+    other._state = AWAITING_REQUEST; // Or some other safe state
+    other._bytesSent = 0;
+    other._requestParsed = false;
+    // std::cout << "Client Move Constructed (fd=" << _clientFd << ")" << std::endl;
+}
+
+// --- Move Assignment Operator ---
+Client& Client::operator=(Client&& other) noexcept {
+    // std::cout << "Client Move Assigned (target fd=" << _clientFd << ", source fd=" << other._clientFd << ")" << std::endl;
+    if (this != &other) {
+        // Note: We don't close the current _clientFd here, as its lifetime
+        // is managed by the Server map/epoll. Just transfer state.
+
+        _clientFd = other._clientFd;
+        _clientAddr = other._clientAddr;
+        _state = other._state;
+        _requestBuffer = std::move(other._requestBuffer);
+        _responseBuffer = std::move(other._responseBuffer);
+        _bytesSent = other._bytesSent;
+        _request = std::move(other._request); // Assuming Request is movable
+        _requestParsed = other._requestParsed;
+
+        // Reset the moved-from object
+        other._clientFd = -1;
+        other._state = AWAITING_REQUEST;
+        other._bytesSent = 0;
+        other._requestParsed = false;
+        other._requestBuffer.clear(); // Clear strings
+        other._responseBuffer.clear();
     }
-    return false;
-}
-
-// --- Internal Logic ---
-
-// Placeholder: Process a fully parsed request
-void Client::processRequest() {
-    // TODO: Implement actual request processing logic here
-    // - Find matching location block using _config->findLocation(_request.getPath())
-    // - Check allowed methods in the location
-    // - Handle GET (serve static file, directory listing, CGI), POST (CGI, upload), DELETE
-    // - Handle redirection
-    // - Handle CGI execution
-    // - Handle file uploads
-
-    // Example: Simple placeholder response
-    std::string body = "<html><body><h1>Hello from Webserv!</h1><p>Request received for path: " +
-                       _request.getPath() + "</p></body></html>";
-    _response.clear(); // Reset response state
-    _response.setStatusCode(200);
-    _response.setHttpVersion(_request.getHttpVersion()); // Use the request's HTTP version
-    _response.setHeader("Content-Type", "text/html");
-    _response.setBody(body); // Sets body and potentially Content-Length
-
-    prepareResponseToSend();
-}
-
-// Placeholder: Build an error response
-void Client::buildErrorResponse(int statusCode) {
-    _response.clear(); // Reset any previous response state
-    _response.setStatusCode(statusCode);
-    _response.setHttpVersion(_request.getHttpVersion().empty() ? "HTTP/1.1" : _request.getHttpVersion()); // Use request version or default
-
-    // TODO: Check config for custom error pages
-    // std::map<int, std::string>::const_iterator it = _config->errorPages.find(statusCode);
-    // if (it != _config->errorPages.end()) { ... load error page ... }
-
-    // Default error page
-    std::string errorBody = "<html><head><title>" + std::to_string(statusCode) + " " +
-                            Utils::getHttpStatusMessage(statusCode) + "</title></head><body><h1>" +
-                            std::to_string(statusCode) + " " + Utils::getHttpStatusMessage(statusCode) +
-                            "</h1></body></html>";
-
-    _response.setHeader("Content-Type", "text/html");
-    _response.setBody(errorBody);
-
-    // Ensure Connection: close for error responses? Usually a good idea.
-    _response.setHeader("Connection", "close");
-
-    prepareResponseToSend();
-}
-
-// Prepare the response to be sent over the socket
-void Client::prepareResponseToSend() {
-    _response.buildResponse();
-    // std::cout << "Prepared response for fd=" << getFd() << ":\n" << std::string(_response.getRawResponsePtr(), _response.getRawResponseSize()) << std::endl; // Debug
+    return *this;
 } 

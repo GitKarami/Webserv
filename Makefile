@@ -1,44 +1,55 @@
+# Executable name
+NAME = webserv
+
 # Compiler and flags
-CXX := c++
-CXXFLAGS := -Wall -Wextra -Werror -std=c++11 -g -Iincludes
+CXX = c++
+# Using C++11 as allowed, plus standard warning flags
+CXXFLAGS = -Wall -Wextra -Werror -std=c++11 # Added -g for debugging symbols
 
-# Source files and object files
-SRCS_DIR := src
-OBJS_DIR := obj
+# Directories
+SRC_DIR = src
+OBJ_DIR = obj
+INC_DIR = inc
 
-SRCS := $(wildcard $(SRCS_DIR)/*.cpp)
-OBJS := $(patsubst $(SRCS_DIR)/%.cpp,$(OBJS_DIR)/%.o,$(SRCS))
+# Find all .cpp files in src directory
+SRCS = $(wildcard $(SRC_DIR)/*.cpp)
 
-# Target executable name
-NAME := webserv
+# Generate object file names in obj directory
+OBJS = $(patsubst $(SRC_DIR)/%.cpp, $(OBJ_DIR)/%.o, $(SRCS))
 
-# Header directories (using -Iincludes)
+# Include directory flag
+CPPFLAGS = -I$(INC_DIR)
 
 # Default rule
 all: $(NAME)
 
-# Linking the executable
+# Rule to link the executable
 $(NAME): $(OBJS)
+	@echo "Linking $(NAME)..."
 	$(CXX) $(CXXFLAGS) $(OBJS) -o $(NAME)
-	@echo "Webserv compiled successfully!"
+	@echo "$(NAME) created successfully."
 
-# Compiling source files into object files
-$(OBJS_DIR)/%.o: $(SRCS_DIR)/%.cpp
-	@mkdir -p $(OBJS_DIR)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+# Rule to compile .cpp files into .o files
+# Creates the obj directory if it doesn't exist
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp
+	@mkdir -p $(OBJ_DIR)
+	@echo "Compiling $<..."
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -c $< -o $@
 
-# Cleaning object files
+# Rule to remove object files
 clean:
-	@rm -rf $(OBJS_DIR)
+	@echo "Cleaning object files..."
+	@rm -rf $(OBJ_DIR)
 	@echo "Object files removed."
 
-# Cleaning executable and object files
+# Rule to remove object files and the executable
 fclean: clean
+	@echo "Cleaning executable..."
 	@rm -f $(NAME)
 	@echo "Executable removed."
 
-# Rebuilding the project
+# Rule to recompile everything
 re: fclean all
 
-# Phony targets
+# Phony targets (targets that don't represent files)
 .PHONY: all clean fclean re

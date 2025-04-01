@@ -1,422 +1,225 @@
 #include "Config.hpp"
-#include "Utils.hpp"
 #include <fstream>
-#include <iostream>
-#include <sstream>
-#include <cstdlib> // For strtol
-#include <limits>  // For numeric_limits
+#include <iostream> // Example include
+#include <sstream> // For parsing
+#include <vector>
+#include <map> // For storing parsed data
+#include <algorithm> // for std::find
+#include <stack> // Include stack for brace matching
 
-Config::Config() : _parsePos(0) {}
+// --- TODO: Define data structures to hold parsed config ---
+// Example structure (needs refinement based on full subject)
+struct LocationConfig {
+    std::string path;
+    std::string root;
+    std::vector<std::string> allowedMethods;
+    std::vector<std::string> indexFiles;
+    bool autoindex;
+    // ... other location directives (cgi, upload_path, return, limit_except etc.)
 
-Config::~Config() {}
+    LocationConfig() : autoindex(false) {} // Default autoindex off
+};
 
-const std::vector<ServerConfig>& Config::getServerConfigs() const {
-    return _servers;
+struct ServerConfig {
+    std::vector<std::pair<std::string, int> > listens; // host:port pairs
+    std::vector<std::string> serverNames;
+    std::string root; // Default root for the server
+    std::vector<std::string> indexFiles; // Default index files
+    std::map<int, std::string> errorPages; // map status code to path
+    size_t clientMaxBodySize;
+    std::vector<LocationConfig> locations;
+
+    ServerConfig() : clientMaxBodySize(1048576) {} // Default 1MB
+};
+// --- End Config Structures ---
+
+Config::Config(const std::string& filename) : _filename(filename) {
+    // Constructor implementation
+    // Consider calling load() here or requiring explicit call
+    std::cout << "Config object created for file: " << _filename << std::endl;
+    // load();
 }
 
-// --- File Loading ---
+Config::~Config() {
+    // Destructor implementation
+}
 
-bool Config::loadFromFile(const std::string& filename) {
-    std::ifstream configFile(filename.c_str());
-    if (!configFile.is_open()) {
-        std::cerr << "Error: Could not open configuration file: " << filename << std::endl;
+// Load and parse the configuration file
+bool Config::load() {
+    std::ifstream configFileStream(_filename.c_str());
+    if (!configFileStream.is_open()) {
+        std::cerr << "Error: Could not open configuration file: " << _filename << std::endl;
         return false;
     }
+    std::cout << "Loading configuration from: " << _filename << std::endl;
 
-    std::stringstream buffer;
-    buffer << configFile.rdbuf();
-    _configContent = buffer.str();
-    configFile.close();
+    std::string line;
+    int lineNumber = 0;
+    ServerConfig currentServer;
+    bool in_server_block = false;
+    std::stack<char> brace_stack; // Use a stack to track nested braces
 
-    _parsePos = 0;
-    _servers.clear();
+    while (std::getline(configFileStream, line)) {
+        lineNumber++;
 
-    // Basic structure: Expect server blocks directly (or inside an http block)
-    // Assuming no http block for simplicity first.
-    try {
-        skipWhitespaceAndComments();
-        while (_parsePos < _configContent.length()) {
-            std::string token = getToken();
-            if (token == "server") {
-                if (!parseServerBlock()) {
-                    return false; // Error during server block parsing
+        // Basic cleanup and comment skipping
+        size_t first = line.find_first_not_of(" \t");
+        if (first == std::string::npos) continue;
+        size_t comment_pos = line.find('#');
+        if (comment_pos != std::string::npos) {
+            line = line.substr(0, comment_pos);
+        }
+        first = line.find_first_not_of(" \t");
+         if (first == std::string::npos || line.empty()) continue; // Skip empty lines after removing comments
+        size_t last = line.find_last_not_of(" \t");
+        line = line.substr(first, (last - first + 1));
+         if (line.empty()) continue;
+
+
+        // Basic block handling using stack
+        if (line.find('{') != std::string::npos) {
+            // Simple check for server block start
+            if (line.find("server") == 0 && line.find('{') > line.find("server")) {
+                if (in_server_block) {
+                     std::cerr << "Error: Nested server blocks not supported (line " << lineNumber << ")" << std::endl;
+                     return false;
                 }
-            } else if (!token.empty()){
-                 std::cerr << "Error: Unexpected token '" << token << "' outside server block at pos " << _parsePos << std::endl;
-                 return false;
+                 in_server_block = true;
+                 currentServer = ServerConfig(); // Reset for new server
+                 brace_stack.push('{');
+                 std::cout << "Entering server block (line " << lineNumber << ")" << std::endl;
+                 continue; // Process next line
             }
-            skipWhitespaceAndComments();
+            // Simple check for location block start *within* a server block
+            else if (in_server_block && line.find("location") == 0 && line.find('{') > line.find("location")) {
+                 brace_stack.push('{'); // Push location block brace
+                 std::cout << "Entering location block (line " << lineNumber << ") - skipping content." << std::endl;
+                 continue; // Process next line
+            }
+            // Handle other opening braces if necessary, or flag as error if unexpected
+            else {
+                 // For simplicity, assume any other '{' is part of a directive value for now
+                 // or potentially part of a location block line we skipped parsing arguments from
+                 if (!brace_stack.empty()) { // If we are inside location block, just assume it's content
+                     brace_stack.push('{');
+                 } else {
+                    std::cerr << "Error: Unexpected '{' (line " << lineNumber << ")" << std::endl;
+                    return false;
+                 }
+            }
         }
-    } catch (const std::exception& e) {
-        std::cerr << "Configuration parsing error: " << e.what() << std::endl;
+
+        if (line.find('}') != std::string::npos) {
+             if (brace_stack.empty()) {
+                 std::cerr << "Error: Unexpected '}' (line " << lineNumber << ")" << std::endl;
+                 return false;
+             }
+             brace_stack.pop(); // Pop the matching brace
+
+             if (brace_stack.empty() && in_server_block) { // If stack is now empty, it's the end of the server block
+                 in_server_block = false;
+                 // TODO: Store the completed currentServer
+                 // _servers.push_back(currentServer);
+                 std::cout << "Exiting server block (line " << lineNumber << ")" << std::endl;
+                 continue;
+             } else if (!brace_stack.empty()) {
+                 // Still inside nested blocks (e.g., location)
+                 std::cout << "Exiting nested block (line " << lineNumber << ")" << std::endl;
+                 continue;
+             } else {
+                 // Should not happen if logic is correct
+                 std::cerr << "Error: Logic error handling '}' (line " << lineNumber << ")" << std::endl;
+                 return false;
+             }
+        }
+
+        // --- Directive Parsing ---
+        // Only parse if inside server block but *outside* nested blocks (brace_stack.size() == 1)
+        if (in_server_block && brace_stack.size() == 1) {
+            std::istringstream lineStream(line);
+            std::string directive;
+            lineStream >> directive;
+
+            // Remove trailing semicolon from the directive itself if present
+             if (!directive.empty() && directive.back() == ';') directive.pop_back();
+
+            // Parse known server-level directives
+            if (directive == "listen") {
+                 std::string listen_arg;
+                 lineStream >> listen_arg;
+                 if (!listen_arg.empty() && listen_arg.back() == ';') listen_arg.pop_back();
+                 // TODO: Parse host:port properly
+                 if (listen_arg == "127.0.0.1:8080") {
+                     currentServer.listens.push_back(std::make_pair("127.0.0.1", 8080));
+                 } else { std::cerr << "Warning: Unrecognized listen format (line " << lineNumber << "): " << line << std::endl; }
+            } else if (directive == "server_name") {
+                 std::string name;
+                 while(lineStream >> name) {
+                     if (!name.empty() && name.back() == ';') name.pop_back();
+                     if (name.empty()) break;
+                     currentServer.serverNames.push_back(name);
+                 }
+            } else if (directive == "root") {
+                lineStream >> currentServer.root;
+                if (!currentServer.root.empty() && currentServer.root.back() == ';') currentServer.root.pop_back();
+            } else if (directive == "index") {
+                 std::string index_file;
+                 while(lineStream >> index_file) {
+                     if (!index_file.empty() && index_file.back() == ';') index_file.pop_back();
+                      if (index_file.empty()) break;
+                     currentServer.indexFiles.push_back(index_file);
+                 }
+            } else if (directive == "error_page") {
+                int code;
+                std::string page_path;
+                if (lineStream >> code >> page_path) {
+                     if (!page_path.empty() && page_path.back() == ';') page_path.pop_back();
+                    currentServer.errorPages[code] = page_path;
+                } else { std::cerr << "Warning: Failed to parse error_page (line " << lineNumber << "): " << line << std::endl; }
+             }
+             // Ignore location directives at this level
+             else if (directive == "location") {
+                  // Already handled block opening above, ignore the line itself here
+             }
+             else {
+                std::cerr << "Warning: Unknown server directive '" << directive << "' (line " << lineNumber << ")" << std::endl;
+            }
+        } else if (!in_server_block && !line.empty()) {
+            // Outside any block - should be an error unless it's a top-level directive (e.g., 'worker_processes' in Nginx)
+            std::cerr << "Warning: Directive outside server block ignored (line " << lineNumber << "): " << line << std::endl;
+        } else if (in_server_block && brace_stack.size() > 1) {
+             // Inside a nested block (location) - content is skipped currently
+             // std::cout << "Skipping content inside nested block (line " << lineNumber << "): " << line << std::endl;
+        }
+
+    } // end while getline
+
+    if (!brace_stack.empty()) {
+        std::cerr << "Error: Unterminated block at end of file. Brace stack size: " << brace_stack.size() << std::endl;
         return false;
     }
-
-    if (_servers.empty()) {
-         std::cerr << "Error: No server blocks found in configuration file." << std::endl;
+     if (in_server_block) { // Should have been set to false by closing brace if file is valid
+         std::cerr << "Error: Server block not properly closed at end of file." << std::endl;
          return false;
-    }
-
-    // TODO: Add validation (e.g., check for duplicate listens, ensure default server exists per port)
-
-    return true;
-}
-
-// --- Parsing Helpers (Basic Implementations) ---
-
-void Config::skipWhitespaceAndComments() {
-    while (_parsePos < _configContent.length()) {
-        if (std::isspace(_configContent[_parsePos])) {
-            _parsePos++;
-        } else if (_configContent[_parsePos] == '#') {
-            // Skip comment line
-            while (_parsePos < _configContent.length() && _configContent[_parsePos] != '\n') {
-                _parsePos++;
-            }
-            if (_parsePos < _configContent.length()) _parsePos++; // Skip the newline itself
-        } else {
-            break; // Found non-whitespace, non-comment character
-        }
-    }
-}
-
-// Gets the next token (word, symbol like {, }, ;)
-std::string Config::getToken() {
-    skipWhitespaceAndComments();
-    if (_parsePos >= _configContent.length()) {
-        return ""; // End of content
-    }
-
-    char currentChar = _configContent[_parsePos];
-
-    // Handle symbols
-    if (currentChar == '{' || currentChar == '}' || currentChar == ';') {
-        _parsePos++;
-        return std::string(1, currentChar);
-    }
-
-    // Handle quoted strings (optional, simple version doesn't handle escapes)
-    /*
-    if (currentChar == '\"' || currentChar == '\'') {
-        char quote = currentChar;
-        _parsePos++;
-        size_t start = _parsePos;
-        while (_parsePos < _configContent.length() && _configContent[_parsePos] != quote) {
-            _parsePos++;
-        }
-        if (_parsePos >= _configContent.length()) { // Unterminated quote
-             throw std::runtime_error("Unterminated quote in configuration file");
-        }
-        std::string token = _configContent.substr(start, _parsePos - start);
-        _parsePos++; // Skip closing quote
-        return token;
-    }
-    */
-
-    // Handle regular words/tokens (until whitespace or symbol)
-    size_t start = _parsePos;
-    while (_parsePos < _configContent.length() && !std::isspace(_configContent[_parsePos]) &&
-           _configContent[_parsePos] != '{' && _configContent[_parsePos] != '}' &&
-           _configContent[_parsePos] != ';' && _configContent[_parsePos] != '#') {
-        _parsePos++;
-    }
-
-    if (_parsePos == start) { // Should not happen if not EOF
-         throw std::runtime_error("Parsing error: Stuck at pos " + std::to_string(_parsePos));
-    }
-
-    return _configContent.substr(start, _parsePos - start);
-}
-
-bool Config::expectToken(const std::string& expected) {
-    std::string token = getToken();
-    if (token != expected) {
-        throw std::runtime_error("Expected token '" + expected + "' but got '" + token + "'");
-    }
-    return true;
-}
-
-// --- Block Parsers (Placeholders/Basic Structure) ---
-
-bool Config::parseServerBlock() {
-    if (!expectToken("{")) return false;
-
-    _servers.push_back(ServerConfig()); // Add a new server config
-    ServerConfig& currentServer = _servers.back();
-
-    skipWhitespaceAndComments();
-    while (true) {
-        std::string directive = getToken();
-        if (directive == "}") {
-            break; // End of server block
-        } else if (directive.empty()) {
-             throw std::runtime_error("Unexpected EOF inside server block");
-        }
-
-        if (directive == "listen") {
-            if (!parseListen(currentServer)) return false;
-        } else if (directive == "server_name") {
-            if (!parseServerName(currentServer)) return false;
-        } else if (directive == "error_page") {
-            if (!parseErrorPage(currentServer)) return false;
-        } else if (directive == "client_max_body_size") {
-            if (!parseClientMaxBodySize(currentServer)) return false;
-        } else if (directive == "location") {
-            if (!parseLocationBlock(currentServer)) return false;
-        } else {
-            throw std::runtime_error("Unknown directive '" + directive + "' in server block");
-        }
-    }
-    // TODO: Validate server block (e.g., must have listen)
-    return true;
-}
-
-bool Config::parseLocationBlock(ServerConfig& currentServer) {
-    std::string path = getToken();
-    if (path.empty() || path == "{" || path == "}" || path == ";") {
-        throw std::runtime_error("Expected location path after 'location' directive");
-    }
-    // TODO: Handle location matching types (prefix, exact, regex - though spec says no regex)
-
-    if (!expectToken("{")) return false;
-
-    currentServer.locations.push_back(Location());
-    Location& currentLoc = currentServer.locations.back();
-    currentLoc.path = path;
-    // Set default allowed methods if none specified later
-    currentLoc.allowedMethods.insert("GET");
-
-    skipWhitespaceAndComments();
-    while (true) {
-        std::string directive = getToken();
-        if (directive == "}") {
-            break; // End of location block
-        } else if (directive.empty()) {
-            throw std::runtime_error("Unexpected EOF inside location block");
-        }
-
-        if (directive == "root") {
-            if (!parseRoot(currentLoc)) return false;
-        } else if (directive == "index") {
-            if (!parseIndex(currentLoc)) return false;
-        } else if (directive == "autoindex") {
-            if (!parseAutoindex(currentLoc)) return false;
-        } else if (directive == "return") {
-            // TODO: Handle return directive
-            std::cerr << "Warning: 'return' directive parsing not fully implemented." << std::endl;
-            // Skip until semicolon for now
-            while (getToken() != ";") { if (_parsePos >= _configContent.length()) throw std::runtime_error("Unexpected EOF after 'return'"); }
-        } else if (directive == "cgi_pass") {
-            // TODO: Handle cgi_pass directive
-            std::cerr << "Warning: 'cgi_pass' directive parsing not fully implemented." << std::endl;
-            while (getToken() != ";") { if (_parsePos >= _configContent.length()) throw std::runtime_error("Unexpected EOF after 'cgi_pass'"); }
-        } else if (directive == "upload_store") {
-            if (!parseUploadStore(currentLoc)) return false;
-        } else if (directive == "allowed_methods") {
-            parseAllowedMethods(currentLoc);
-        } else {
-             throw std::runtime_error("Unknown directive '" + directive + "' in location block");
-        }
-    }
-     // TODO: Validate location block
-    return true;
-}
-
-// --- Directive Parsers (Stubs/Basic Logic) ---
-// These need more robust error handling and value parsing
-
-bool Config::parseListen(ServerConfig& currentServer) {
-    std::string value = getToken();
-    // TODO: Parse host:port format (e.g., 127.0.0.1:8080, *:80, 80)
-    // Simple version: Assume only port for now
-    try {
-        char* endptr;
-        long port_l = std::strtol(value.c_str(), &endptr, 10);
-        if (*endptr != '\0' || port_l <= 0 || port_l > 65535) {
-            throw std::invalid_argument("Invalid port number");
-        }
-        currentServer.port = static_cast<int>(port_l);
-        currentServer.host = "0.0.0.0"; // Default host if only port given
-    } catch (...) {
-         throw std::runtime_error("Invalid listen directive value: " + value);
-    }
-    if (!expectToken(";")) return false;
-    return true;
-}
-
-bool Config::parseServerName(ServerConfig& currentServer) {
-    std::string name;
-    while ((name = getToken()) != ";") {
-        if (name.empty() || name == "{" || name == "}") {
-             throw std::runtime_error("Invalid server_name value or missing semicolon");
-        }
-        currentServer.serverNames.insert(name);
-    }
-    return true;
-}
-
-bool Config::parseErrorPage(ServerConfig& currentServer) {
-     std::vector<int> codes;
-     std::string token;
-     while ((token = getToken()) != ";") {
-          if (token.empty() || token == "{" || token == "}") throw std::runtime_error("Invalid error_page format");
-          // Check if it's the path (starts with / or .) or a number
-          if (token[0] == '/' || token[0] == '.') {
-              if (codes.empty()) throw std::runtime_error("Error page path specified before error codes");
-              for(std::vector<int>::iterator it = codes.begin(); it != codes.end(); ++it) {
-                   currentServer.errorPages[*it] = token;
-              }
-              if (!expectToken(";")) return false; // Path must be last before semicolon
-              return true;
-          } else { // Should be an error code
-               try {
-                    char* endptr;
-                    long code_l = std::strtol(token.c_str(), &endptr, 10);
-                    if (*endptr != '\0' || code_l < 300 || code_l > 599) throw std::invalid_argument("Invalid code");
-                    codes.push_back(static_cast<int>(code_l));
-               } catch (...) { throw std::runtime_error("Invalid error code value: " + token); }
-          }
      }
-     if (codes.empty()) throw std::runtime_error("No error codes specified for error_page");
-     // Semicolon was consumed, but no path was found
-     throw std::runtime_error("Missing error page path for error_page directive");
+
+
+    // --- Placeholder: Print parsed data ---
+    std::cout << "--- Parsed Config (Placeholder) ---" << std::endl;
+    for(size_t i = 0; i < currentServer.listens.size(); ++i) std::cout << "Listen: " << currentServer.listens[i].first << ":" << currentServer.listens[i].second << std::endl;
+    std::cout << "Root: " << currentServer.root << std::endl;
+    std::cout << "Index: "; for(size_t i = 0; i< currentServer.indexFiles.size(); ++i) std::cout << currentServer.indexFiles[i] << " "; std::cout << std::endl;
+    for(std::map<int, std::string>::const_iterator it = currentServer.errorPages.begin(); it != currentServer.errorPages.end(); ++it) std::cout << "Error Page " << it->first << ": " << it->second << std::endl;
+    std::cout << "---------------------------------" << std::endl;
+
+    return true; // Assume success if no fatal parse errors occurred
 }
 
-bool Config::parseClientMaxBodySize(ServerConfig& currentServer) {
-    std::string value = getToken();
-    size_t multiplier = 1;
-    char suffix = '\0';
-    if (!value.empty() && (value.back() == 'k' || value.back() == 'K' || value.back() == 'm' || value.back() == 'M')) {
-        suffix = std::tolower(value.back());
-        value.pop_back(); // Remove suffix for parsing number
-        if (suffix == 'k') multiplier = 1024;
-        else if (suffix == 'm') multiplier = 1024 * 1024;
-    }
-     try {
-        char* endptr;
-        long size_l = std::strtol(value.c_str(), &endptr, 10);
-        if (*endptr != '\0' || size_l < 0) throw std::invalid_argument("Invalid size");
-        // Check for overflow before multiplying
-        if (size_l > static_cast<long>(std::numeric_limits<size_t>::max() / multiplier)) {
-             throw std::overflow_error("client_max_body_size value too large");
-        }
-        currentServer.clientMaxBodySize = static_cast<size_t>(size_l) * multiplier;
-    } catch (const std::overflow_error& oe) {
-        throw std::runtime_error(oe.what());
-    } catch (...) { throw std::runtime_error("Invalid client_max_body_size value: " + value); }
-    if (!expectToken(";")) return false;
+// Placeholder for parsing logic
+bool Config::parseFile() {
+    // Implementation needed
     return true;
 }
 
-bool Config::parseRoot(Location& currentLoc) {
-    std::string value = getToken();
-    if (value.empty() || value == ";" || value == "{" || value == "}") throw std::runtime_error("Missing root path");
-    currentLoc.root = value;
-     // TODO: Validate path? (e.g., absolute?)
-    if (!expectToken(";")) return false;
-    return true;
-}
-
-bool Config::parseIndex(Location& currentLoc) {
-    std::string file;
-    currentLoc.indexFiles.clear(); // Clear defaults if specified
-    while ((file = getToken()) != ";") {
-        if (file.empty() || file == "{" || file == "}") throw std::runtime_error("Invalid index file or missing semicolon");
-        currentLoc.indexFiles.push_back(file);
-    }
-    if (currentLoc.indexFiles.empty()) throw std::runtime_error("No index files specified after 'index' directive");
-    return true;
-}
-
-bool Config::parseAutoindex(Location& currentLoc) {
-    std::string value = getToken();
-    if (value == "on") currentLoc.autoindex = true;
-    else if (value == "off") currentLoc.autoindex = false;
-    else throw std::runtime_error("Invalid autoindex value: " + value + " (must be 'on' or 'off')");
-    if (!expectToken(";")) return false;
-    return true;
-}
-
-bool Config::parseUploadStore(Location& currentLoc) {
-    std::string value = getToken();
-    if (value.empty() || value == ";" || value == "{" || value == "}") {
-        throw std::runtime_error("Missing upload store path after 'upload_store' directive");
-    }
-    currentLoc.uploadStore = value;
-    // TODO: Validate path? Check permissions?
-    if (!expectToken(";")) return false;
-    return true;
-}
-
-void Config::parseAllowedMethods(Location& location) {
-    std::string methodToken;
-    location.allowedMethods.clear(); // Clear any defaults if specified
-
-    while (true) {
-        methodToken = getToken();
-        if (methodToken == ";") {
-            break; // End of directive
-        }
-        if (methodToken.empty()) {
-            throw std::runtime_error("Unexpected EOF while parsing allowed_methods");
-        }
-
-        // Basic validation (can be expanded)
-        if (methodToken == "GET" || methodToken == "POST" || methodToken == "DELETE" || methodToken == "HEAD" || methodToken == "PUT") {
-             // std::set automatically handles duplicates, so just insert.
-             location.allowedMethods.insert(methodToken);
-        } else {
-            throw std::runtime_error("Invalid or unsupported HTTP method '" + methodToken + "' in allowed_methods");
-        }
-    }
-
-    if (location.allowedMethods.empty()) {
-        // If no methods were listed before ';', it's arguably an error, or implies default (e.g., GET only?)
-        // For now, let's treat it as implicitly allowing GET if nothing else is specified.
-         std::cerr << "Warning: 'allowed_methods' specified but no methods listed. Defaulting to GET." << std::endl;
-         location.allowedMethods.insert("GET"); // Use insert for set
-         // Alternatively, throw an error:
-         // throw std::runtime_error("No methods specified for allowed_methods directive");
-    }
-}
-
-// --- Server/Location Finding Logic (Needs Implementation) ---
-
-const ServerConfig* Config::findServerConfig(const std::string& host, int port, const std::string& serverName) const {
-    const ServerConfig* defaultServer = NULL;
-    for (std::vector<ServerConfig>::const_iterator it = _servers.begin(); it != _servers.end(); ++it) {
-        const ServerConfig& server = *it;
-        if (server.port == port && (server.host == "0.0.0.0" || server.host == host)) {
-            // Match port and host (or wildcard host)
-            if (!defaultServer) {
-                 defaultServer = &server; // First match for this host:port is default
-            }
-            if (server.serverNames.count(serverName)) {
-                return &server; // Exact server_name match
-            }
-            // TODO: Add wildcard server_name matching if needed
-        }
-    }
-    return defaultServer; // Return default if no specific name matched
-}
-
-const Location* ServerConfig::findLocation(const std::string& requestPath) const {
-    const Location* bestMatch = NULL;
-    size_t longestMatchLen = 0;
-
-    for (std::vector<Location>::const_iterator it = locations.begin(); it != locations.end(); ++it) {
-        const Location& loc = *it;
-        // Simple prefix matching
-        if (Utils::startsWith(requestPath, loc.path)) {
-            // Check if this match is longer than the current best match
-            if (loc.path.length() > longestMatchLen) {
-                longestMatchLen = loc.path.length();
-                bestMatch = &loc;
-            }
-            // Exact match is usually preferred, treat '/' special?
-            // Nginx has more complex matching rules (prefix, exact, regex)
-            // For now, longest prefix match wins.
-        }
-    }
-    return bestMatch;
-} 
+// Implement Config methods here
+// e.g., bool Config::load() { ... } 

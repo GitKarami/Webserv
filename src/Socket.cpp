@@ -1,249 +1,125 @@
 #include "Socket.hpp"
-#include <fcntl.h>
 #include <sys/socket.h>
-#include <unistd.h>
-#include <stdexcept>
-#include <cstring>
-#include <cerrno>
-#include <iostream> // For error logging
-#include <netdb.h>      // For getaddrinfo
-#include <arpa/inet.h>  // For inet_ntop
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h> // for close
+#include <fcntl.h>  // for fcntl
+#include <stdexcept> // for exceptions
+#include <cstring>   // for memset
+#include <iostream> // for error messages
 
-// --- Constructors / Destructor / Move Semantics ---
-
-Socket::Socket() : _fd(-1) {}
-
-Socket::Socket(int fd) : _fd(fd) {
-    if (_fd < 0) {
-        // Or throw? For now, just mark as invalid.
-        _fd = -1;
-    }
+// Constructor: Initializes port and sets sockfd to -1
+Socket::Socket(int port) : _sockfd(-1), _port(port) {
+    std::memset(&_address, 0, sizeof(_address));
+    // std::cout << "Socket object created for port " << _port << "." << std::endl;
 }
 
+// Destructor: Ensures the socket is closed
 Socket::~Socket() {
-    close();
+    // std::cout << "Socket object destroyed." << std::endl;
+    closeSocket();
 }
 
-Socket::Socket(Socket&& other) noexcept : _fd(other._fd) {
-    other._fd = -1; // Prevent double close
+// --- Move Constructor ---
+Socket::Socket(Socket&& other) noexcept :
+    _sockfd(other._sockfd),
+    _port(other._port),
+    _address(other._address)
+{
+    // Leave the moved-from object in a safe state (no active socket)
+    other._sockfd = -1;
+    other._port = 0; // Or keep port? Doesn't matter much if sockfd is -1
+    std::memset(&other._address, 0, sizeof(other._address));
+     // std::cout << "Socket Move Constructed (fd=" << _sockfd << ")" << std::endl;
 }
 
+// --- Move Assignment Operator ---
 Socket& Socket::operator=(Socket&& other) noexcept {
-    if (this != &other) {
-        close(); // Close existing socket if any
-        _fd = other._fd;
-        other._fd = -1;
+    // std::cout << "Socket Move Assigned (target fd=" << _sockfd << ", source fd=" << other._sockfd << ")" << std::endl;
+    if (this != &other) { // Prevent self-assignment
+        // Close existing socket if necessary before taking ownership of the new one
+        closeSocket();
+
+        // Transfer ownership of resources
+        _sockfd = other._sockfd;
+        _port = other._port;
+        _address = other._address;
+
+        // Reset the moved-from object
+        other._sockfd = -1;
+        other._port = 0;
+        std::memset(&other._address, 0, sizeof(other._address));
     }
     return *this;
 }
 
-// --- Socket Operations ---
-
-bool Socket::create(int domain, int type, int protocol) {
-    if (isValid()) {
-        std::cerr << "Socket::create error: Socket already created (fd=" << _fd << ")" << std::endl;
+// Initialize the socket: create, set options, bind, listen
+bool Socket::init(const std::string& host) {
+    // 1. Create socket
+    _sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (_sockfd < 0) {
+        perror("socket creation failed");
         return false;
     }
-    _fd = ::socket(domain, type, protocol);
-    if (_fd < 0) {
-        std::cerr << "Socket::create error: " << strerror(errno) << std::endl;
-        _fd = -1;
+    // std::cout << "Socket created (fd=" << _sockfd << ")." << std::endl;
+
+    // 2. Set socket options (allow address reuse)
+    int opt = 1;
+    if (setsockopt(_sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        perror("setsockopt(SO_REUSEADDR) failed");
+        closeSocket();
         return false;
     }
-    return true;
-}
+    // std::cout << "Socket option SO_REUSEADDR set." << std::endl;
 
-bool Socket::bind(const struct sockaddr* addr, socklen_t addrlen) {
-    if (!isValid()) {
-        std::cerr << "Socket::bind error: Invalid socket" << std::endl;
+    // 3. Make socket non-blocking
+    if (fcntl(_sockfd, F_SETFL, O_NONBLOCK) < 0) {
+        perror("fcntl(O_NONBLOCK) failed");
+        closeSocket();
         return false;
     }
-    if (::bind(_fd, addr, addrlen) < 0) {
-        std::cerr << "Socket::bind error: " << strerror(errno) << std::endl;
-        // Don't close here, let the caller decide based on the error
+    // std::cout << "Socket set to non-blocking." << std::endl;
+
+    // 4. Prepare the sockaddr_in structure
+    _address.sin_family = AF_INET;
+    // Use inet_addr to convert host string to network address
+    _address.sin_addr.s_addr = inet_addr(host.c_str());
+    if (_address.sin_addr.s_addr == INADDR_NONE) {
+         std::cerr << "Invalid address: " << host << std::endl;
+         closeSocket();
+         return false;
+    }
+    _address.sin_port = htons(_port); // Convert port to network byte order
+
+    // 5. Bind the socket to the address and port
+    if (bind(_sockfd, (struct sockaddr*)&_address, sizeof(_address)) < 0) {
+        perror(("bind failed for " + host + ":" + std::to_string(_port)).c_str());
+        closeSocket();
         return false;
     }
-    return true;
-}
+    std::cout << "Socket bound to " << host << ":" << _port << "." << std::endl;
 
-bool Socket::bind(const std::string& host, int port) {
-    if (!isValid()) {
-        std::cerr << "Socket::bind error: Invalid socket" << std::endl;
+    // 6. Listen for incoming connections
+    if (listen(_sockfd, SOMAXCONN) < 0) {
+        perror("listen failed");
+        closeSocket();
         return false;
     }
-
-    struct addrinfo hints, *res, *p;
-    memset(&hints, 0, sizeof hints);
-    hints.ai_family = AF_UNSPEC; // AF_INET or AF_INET6, or AF_UNSPEC for either
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_flags = AI_PASSIVE; // Fill in my IP for me
-
-    std::string portStr = std::to_string(port);
-    int status = getaddrinfo(host.empty() ? NULL : host.c_str(), portStr.c_str(), &hints, &res);
-    if (status != 0) {
-        std::cerr << "Socket::bind getaddrinfo error: " << gai_strerror(status) << std::endl;
-        return false;
-    }
-
-    bool bound = false;
-    for (p = res; p != NULL; p = p->ai_next) {
-        if (::bind(_fd, p->ai_addr, p->ai_addrlen) == 0) {
-            bound = true; // Successfully bound
-            break;
-        }
-        // If bind fails, print error but keep trying other addresses from getaddrinfo
-        std::cerr << "Socket::bind attempt failed: " << strerror(errno) << std::endl;
-    }
-
-    freeaddrinfo(res); // Free the linked list
-
-    if (!bound) {
-        std::cerr << "Socket::bind error: Could not bind to any address for " << host << ":" << port << std::endl;
-        return false;
-    }
+    std::cout << "Socket listening with backlog " << SOMAXCONN << "." << std::endl;
 
     return true;
 }
 
-bool Socket::listen(int backlog) {
-    if (!isValid()) {
-        std::cerr << "Socket::listen error: Invalid socket" << std::endl;
-        return false;
+// Close the socket
+void Socket::closeSocket() {
+    if (_sockfd >= 0) {
+        // std::cout << "Closing socket (fd=" << _sockfd << ")." << std::endl;
+        close(_sockfd);
+        _sockfd = -1; // Mark as closed
     }
-    if (::listen(_fd, backlog) < 0) {
-        std::cerr << "Socket::listen error: " << strerror(errno) << std::endl;
-        return false;
-    }
-    return true;
 }
 
-int Socket::accept(struct sockaddr* addr, socklen_t* addrlen) {
-    if (!isValid()) {
-        std::cerr << "Socket::accept error: Invalid socket" << std::endl;
-        return -1;
-    }
-    int clientFd = ::accept(_fd, addr, addrlen);
-    if (clientFd < 0) {
-        // EAGAIN/EWOULDBLOCK are expected for non-blocking sockets, not necessarily errors
-        if (errno != EAGAIN && errno != EWOULDBLOCK) {
-             std::cerr << "Socket::accept error: " << strerror(errno) << std::endl;
-        }
-        return -1; // Return -1 on error or no connection pending
-    }
-    return clientFd;
-}
-
-bool Socket::connect(const struct sockaddr* addr, socklen_t addrlen) {
-    if (!isValid()) {
-        std::cerr << "Socket::connect error: Invalid socket" << std::endl;
-        return false;
-    }
-    if (::connect(_fd, addr, addrlen) < 0) {
-        // EINPROGRESS is expected for non-blocking sockets
-        if (errno != EINPROGRESS) { 
-             std::cerr << "Socket::connect error: " << strerror(errno) << std::endl;
-             return false;
-        }
-        // For non-blocking, connect returns -1 and sets errno to EINPROGRESS.
-        // The connection completes asynchronously.
-        // The caller needs to use poll/select to check writability for completion.
-    }
-    return true; // Indicates connection attempt initiated (or succeeded immediately)
-}
-
-ssize_t Socket::send(const void* buf, size_t len, int flags) {
-    if (!isValid()) {
-        std::cerr << "Socket::send error: Invalid socket" << std::endl;
-        return -1;
-    }
-    ssize_t bytesSent = ::send(_fd, buf, len, flags);
-    if (bytesSent < 0) {
-        if (errno != EAGAIN && errno != EWOULDBLOCK) {
-             std::cerr << "Socket::send error: " << strerror(errno) << std::endl;
-        }
-        // Return -1 on error or if would block
-    }
-    return bytesSent;
-}
-
-ssize_t Socket::recv(void* buf, size_t len, int flags) {
-    if (!isValid()) {
-        std::cerr << "Socket::recv error: Invalid socket" << std::endl;
-        return -1;
-    }
-    ssize_t bytesRead = ::recv(_fd, buf, len, flags);
-    if (bytesRead < 0) {
-         if (errno != EAGAIN && errno != EWOULDBLOCK) {
-             std::cerr << "Socket::recv error: " << strerror(errno) << std::endl;
-         }
-         // Return -1 on error or if would block
-    } else if (bytesRead == 0) {
-        // Peer has closed the connection gracefully
-    }
-    return bytesRead;
-}
-
-bool Socket::close() {
-    if (isValid()) {
-        if (::close(_fd) < 0) {
-            std::cerr << "Socket::close error for fd " << _fd << ": " << strerror(errno) << std::endl;
-            // Even if close fails, mark fd as invalid to prevent reuse attempts
-            _fd = -1;
-            return false;
-        }
-        _fd = -1;
-        return true;
-    }
-    return true; // Already closed or invalid, considered success
-}
-
-// --- Socket Options ---
-
-bool Socket::setReuseAddr(bool enable) {
-    if (!isValid()) {
-        std::cerr << "Socket::setReuseAddr error: Invalid socket" << std::endl;
-        return false;
-    }
-    int optval = enable ? 1 : 0;
-    if (::setsockopt(_fd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0) {
-        std::cerr << "Socket::setReuseAddr error: " << strerror(errno) << std::endl;
-        return false;
-    }
-    return true;
-}
-
-bool Socket::setNonBlocking(bool enable) {
-    if (!isValid()) {
-        std::cerr << "Socket::setNonBlocking error: Invalid socket" << std::endl;
-        return false;
-    }
-    int flags = ::fcntl(_fd, F_GETFL, 0);
-    if (flags == -1) {
-        std::cerr << "Socket::setNonBlocking (F_GETFL) error: " << strerror(errno) << std::endl;
-        return false;
-    }
-    flags = enable ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK);
-    if (::fcntl(_fd, F_SETFL, flags) == -1) {
-        std::cerr << "Socket::setNonBlocking (F_SETFL) error: " << strerror(errno) << std::endl;
-        return false;
-    }
-    return true;
-}
-
-// --- Getters ---
-
+// Get the file descriptor
 int Socket::getFd() const {
-    return _fd;
+    return _sockfd;
 }
-
-bool Socket::isValid() const {
-    return _fd >= 0;
-}
-
-// --- Release ---
-
-int Socket::release() {
-    int tempFd = _fd;
-    _fd = -1; // Socket object no longer owns the fd
-    return tempFd;
-} 
